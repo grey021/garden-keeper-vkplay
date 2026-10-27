@@ -152,7 +152,7 @@ html, body { overscroll-behavior: none; }
           var value = Number(data.loginStatus);
           bridge.loginStatus = [0, 1, 2, 3].indexOf(value) >= 0 ? value : 0;
           // Reload confirmed purchases for an already signed-in player.
-          if (bridge.loginStatus >= 2) getPaymentSession().catch(function () {});
+          if (bridge.loginStatus >= 2) getPaymentSession().catch(function (error) { logPaymentFailure('restore', error); });
         }
       },
       registerUserCallback: function (data) {
@@ -195,6 +195,11 @@ html, body { overscroll-behavior: none; }
   script.onerror = fail;
   document.head.appendChild(script);
 
+  function logPaymentFailure(stage, error) {
+    var message = error && typeof error.message === 'string' ? error.message : '';
+    var code = /^[a-z0-9_]{1,80}$/.test(message) ? message : 'unavailable';
+    console.warn('[VK Play] ' + stage + ': ' + code);
+  }
   function apiRequest(path, options) {
     return fetch(bridge.paymentApiBase + path, Object.assign({ cache: 'no-store' }, options || {})).then(function (response) {
       return response.json().then(function (data) {
@@ -265,7 +270,7 @@ html, body { overscroll-behavior: none; }
     }).then(function (order) {
       if (!order || !order.merchant_param || bridge.payState === 'cancel') return;
       bridge.api.paymentFrame({ merchant_param: order.merchant_param });
-    }).catch(function () { bridge.payState = 'error'; bridge._buying = ''; });
+    }).catch(function (error) { logPaymentFailure('purchase', error); bridge.payState = 'error'; bridge._buying = ''; });
   }
   function verifyPurchase() {
     if (!bridge._buying) return;
