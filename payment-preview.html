@@ -38,7 +38,7 @@ body {
 }
 
 #status {
-	background-color: #242424;
+	background-color: #17110d;
 	display: flex;
 	flex-direction: column;
 	justify-content: center;
@@ -96,6 +96,17 @@ body {
 <style>
 canvas { touch-action: none; user-select: none; -webkit-user-select: none; }
 html, body { overscroll-behavior: none; }
+#status { background: #17110d; }
+#status-splash.fullsize--true { object-fit: cover; }
+#status-progress {
+  bottom: 7%; width: min(320px, 52%); height: 5px;
+  border: 0; border-radius: 3px; overflow: hidden;
+  background: rgba(235, 217, 181, .25); color: #d4b37c;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .65);
+}
+#status-progress::-webkit-progress-bar { background: rgba(235, 217, 181, .25); }
+#status-progress::-webkit-progress-value { background: #d4b37c; }
+#status-progress::-moz-progress-bar { background: #d4b37c; }
 </style>
 <script>
 (function () {
@@ -124,7 +135,7 @@ html, body { overscroll-behavior: none; }
     // The client can open a payment window, but it can never grant a purchase itself.
     paymentApiBase: 'https://garden-keeper-payments.garden-keeper-51050.workers.dev',
     payments: null, products: [], catalog: [], payState: 'error',
-    _session: null, _sessionPromise: null, _tokenWaiter: null, _buying: '',
+    _session: null, _sessionPromise: null, _tokenWaiter: null, _buying: '', _verifying: false,
     buy: function (product) { beginPurchase(product); },
     login: function () {
       if (!this.api) return;
@@ -170,7 +181,8 @@ html, body { overscroll-behavior: none; }
       paymentFrameUrlCallback: function () {},
       paymentReceivedCallback: function () { verifyPurchase(); },
       paymentWindowClosedCallback: function () {
-        if (bridge.payState === 'pending') bridge.payState = 'cancel';
+        // VK Play may close its window before the signed server callback arrives.
+        if (bridge.payState === 'pending') verifyPurchase();
       },
       userConfirmCallback: function () {}, confirmWindowClosedCallback: function () {},
       paymentFrameItem: function () {}, getGameInventoryItemsCallback: function () {}
@@ -273,19 +285,20 @@ html, body { overscroll-behavior: none; }
     }).catch(function (error) { logPaymentFailure('purchase', error); bridge.payState = 'error'; bridge._buying = ''; });
   }
   function verifyPurchase() {
-    if (!bridge._buying) return;
+    if (!bridge._buying || bridge._verifying) return;
+    bridge._verifying = true;
     bridge.payState = 'verifying';
     var product = bridge._buying;
     var attempts = 0;
     function poll() {
       refreshEntitlements().then(function (owned) {
         if (owned.indexOf(product) >= 0) {
-          bridge.payState = 'done'; bridge._buying = ''; return;
+          bridge.payState = 'done'; bridge._buying = ''; bridge._verifying = false; return;
         }
-        if (++attempts >= 15) { bridge.payState = 'error'; bridge._buying = ''; return; }
+        if (++attempts >= 30) { bridge.payState = 'error'; bridge._buying = ''; bridge._verifying = false; return; }
         setTimeout(poll, 1000);
       }).catch(function () {
-        bridge.payState = 'error'; bridge._buying = '';
+        bridge.payState = 'error'; bridge._buying = ''; bridge._verifying = false;
       });
     }
     poll();
@@ -305,14 +318,14 @@ html, body { overscroll-behavior: none; }
 		</noscript>
 
 		<div id="status">
-			<img id="status-splash" class="show-image--true fullsize--true use-filter--true" src="index.png" alt="">
+			<img id="status-splash" class="show-image--true fullsize--true use-filter--true" src="loading-garden.png" alt="">
 			<progress id="status-progress"></progress>
 			<div id="status-notice"></div>
 		</div>
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":13809524,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.wasm":39514754,"index-8920f4be2dc2.pck":19156680},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"mainPack":"index-8920f4be2dc2.pck"};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
