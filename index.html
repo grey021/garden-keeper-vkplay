@@ -38,7 +38,7 @@ body {
 }
 
 #status {
-	background-color: #242424;
+	background-color: #17110d;
 	display: flex;
 	flex-direction: column;
 	justify-content: center;
@@ -89,13 +89,6 @@ body {
 	text-align: center;
 	z-index: 1;
 }
-		
-#status { background: #17110d; }
-#status-splash.fullsize--true { object-fit: cover; }
-#status-progress { bottom: 7%; width: min(320px, 52%); height: 5px; border: 0; border-radius: 3px; overflow: hidden; background: rgba(235, 217, 181, .25); color: #d4b37c; box-shadow: 0 1px 4px rgba(0, 0, 0, .65); }
-#status-progress::-webkit-progress-bar { background: rgba(235, 217, 181, .25); }
-#status-progress::-webkit-progress-value { background: #d4b37c; }
-#status-progress::-moz-progress-bar { background: #d4b37c; }
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
 <link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
@@ -103,6 +96,17 @@ body {
 <style>
 canvas { touch-action: none; user-select: none; -webkit-user-select: none; }
 html, body { overscroll-behavior: none; }
+#status { background: #17110d; }
+#status-splash.fullsize--true { object-fit: cover; }
+#status-progress {
+  bottom: 7%; width: min(320px, 52%); height: 5px;
+  border: 0; border-radius: 3px; overflow: hidden;
+  background: rgba(235, 217, 181, .25); color: #d4b37c;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .65);
+}
+#status-progress::-webkit-progress-bar { background: rgba(235, 217, 181, .25); }
+#status-progress::-webkit-progress-value { background: #d4b37c; }
+#status-progress::-moz-progress-bar { background: #d4b37c; }
 </style>
 <script>
 (function () {
@@ -127,9 +131,12 @@ html, body { overscroll-behavior: none; }
     setRecord: function () {},
     loadTop: function () { this.top = null; this.topLoaded = true; },
     checkAuth: function () { return this.loginStatus === 2 || this.loginStatus === 3; },
-    // No client-only entitlement grants. Enable payments only with a verified backend.
+    // VK Play payment entitlements are read only from the signed Cloudflare callback.
+    // The client can open a payment window, but it can never grant a purchase itself.
+    paymentApiBase: 'https://garden-keeper-payments.garden-keeper-51050.workers.dev',
     payments: null, products: [], catalog: [], payState: 'error',
-    buy: function () { this.payState = 'error'; },
+    _session: null, _sessionPromise: null, _tokenWaiter: null, _buying: '', _verifying: false,
+    buy: function (product) { beginPurchase(product); },
     login: function () {
       if (!this.api) return;
       try {
@@ -155,14 +162,28 @@ html, body { overscroll-behavior: none; }
         if (data && data.status === 'ok') {
           var value = Number(data.loginStatus);
           bridge.loginStatus = [0, 1, 2, 3].indexOf(value) >= 0 ? value : 0;
+          // Reload confirmed purchases for an already signed-in player.
+          if (bridge.loginStatus >= 2) getPaymentSession().catch(function (error) { logPaymentFailure('restore', error); });
         }
       },
       registerUserCallback: function (data) {
         if (data && data.status === 'ok' && bridge.api) bridge.api.getLoginStatus();
       },
       userInfoCallback: function () {}, userProfileCallback: function () {},
-      getAuthTokenCallback: function () {}, paymentFrameUrlCallback: function () {},
-      paymentReceivedCallback: function () {}, paymentWindowClosedCallback: function () {},
+      getAuthTokenCallback: function (data) {
+        var waiter = bridge._tokenWaiter;
+        if (!waiter) return;
+        bridge._tokenWaiter = null;
+        clearTimeout(waiter.timer);
+        if (data && data.status === 'ok' && data.uid && data.hash) waiter.resolve({ uid: String(data.uid), hash: String(data.hash) });
+        else waiter.reject(new Error('vkplay_auth_required'));
+      },
+      paymentFrameUrlCallback: function () {},
+      paymentReceivedCallback: function () { verifyPurchase(); },
+      paymentWindowClosedCallback: function () {
+        // VK Play may close its window before the signed server callback arrives.
+        if (bridge.payState === 'pending') verifyPurchase();
+      },
       userConfirmCallback: function () {}, confirmWindowClosedCallback: function () {},
       paymentFrameItem: function () {}, getGameInventoryItemsCallback: function () {}
     };
@@ -172,6 +193,7 @@ html, body { overscroll-behavior: none; }
         clearTimeout(deadline);
         bridge.api = api; bridge.sdkState = 'connected'; bridge.loading = false;
         try { api.getLoginStatus(); } catch (e) { /* Guest gameplay remains available. */ }
+        loadPaymentCatalog();
       }, fail);
     } catch (e) { fail(); }
   }
@@ -184,6 +206,103 @@ html, body { overscroll-behavior: none; }
   };
   script.onerror = fail;
   document.head.appendChild(script);
+
+  function logPaymentFailure(stage, error) {
+    var message = error && typeof error.message === 'string' ? error.message : '';
+    var code = /^[a-z0-9_]{1,80}$/.test(message) ? message : 'unavailable';
+    console.warn('[VK Play] ' + stage + ': ' + code);
+  }
+  function apiRequest(path, options) {
+    return fetch(bridge.paymentApiBase + path, Object.assign({ cache: 'no-store' }, options || {})).then(function (response) {
+      return response.json().then(function (data) {
+        if (!response.ok) throw new Error(data && data.error ? data.error : 'payment_service_unavailable');
+        return data;
+      });
+    });
+  }
+  function loadPaymentCatalog() {
+    apiRequest('/catalog').then(function (data) {
+      bridge.catalog = Array.isArray(data.products) ? data.products : [];
+      bridge.payments = bridge.catalog.length ? true : null;
+    }).catch(function () { bridge.payments = null; bridge.catalog = []; });
+  }
+  function getPlatformToken() {
+    if (!bridge.api || typeof bridge.api.getAuthToken !== 'function') return Promise.reject(new Error('vkplay_auth_required'));
+    return new Promise(function (resolve, reject) {
+      if (bridge._tokenWaiter) return reject(new Error('vkplay_auth_pending'));
+      var waiter = { resolve: resolve, reject: reject, timer: 0 };
+      waiter.timer = setTimeout(function () {
+        if (bridge._tokenWaiter === waiter) bridge._tokenWaiter = null;
+        reject(new Error('vkplay_auth_timeout'));
+      }, 12000);
+      bridge._tokenWaiter = waiter;
+      try { bridge.api.getAuthToken(); }
+      catch (e) { clearTimeout(waiter.timer); bridge._tokenWaiter = null; reject(new Error('vkplay_auth_required')); }
+    });
+  }
+  function getPaymentSession() {
+    if (bridge._session && bridge._session.expiresAt > Math.floor(Date.now() / 1000) + 30) return Promise.resolve(bridge._session);
+    if (bridge._sessionPromise) return bridge._sessionPromise;
+    bridge._sessionPromise = getPlatformToken().then(function (token) {
+      return apiRequest('/session', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(token)
+      });
+    }).then(function (session) {
+      bridge._session = session;
+      bridge.products = Array.isArray(session.products) ? session.products : [];
+      return session;
+    }).finally(function () { bridge._sessionPromise = null; });
+    return bridge._sessionPromise;
+  }
+  function refreshEntitlements() {
+    if (!bridge._session) return Promise.reject(new Error('vkplay_session_required'));
+    return apiRequest('/me', { headers: { Authorization: 'Bearer ' + bridge._session.token } }).then(function (data) {
+      bridge.products = Array.isArray(data.products) ? data.products : [];
+      return bridge.products;
+    });
+  }
+  function beginPurchase(product) {
+    if (bridge.payState === 'pending' || bridge.payState === 'verifying') return;
+    var entry = bridge.catalog.filter(function (item) { return item.id === product; })[0];
+    if (!entry || !bridge.api || typeof bridge.api.paymentFrame !== 'function') { bridge.payState = 'error'; return; }
+    if (bridge.loginStatus < 2) {
+      try { if (bridge.loginStatus === 1) bridge.api.registerUser(); else bridge.api.authUser(); } catch (e) {}
+      bridge.payState = 'error';
+      return;
+    }
+    bridge._buying = product;
+    bridge.payState = 'pending';
+    getPaymentSession().then(function (session) {
+      return apiRequest('/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.token },
+        body: JSON.stringify({ product: product })
+      });
+    }).then(function (order) {
+      if (!order || !order.merchant_param || bridge.payState === 'cancel') return;
+      bridge.api.paymentFrame({ merchant_param: order.merchant_param });
+    }).catch(function (error) { logPaymentFailure('purchase', error); bridge.payState = 'error'; bridge._buying = ''; });
+  }
+  function verifyPurchase() {
+    if (!bridge._buying || bridge._verifying) return;
+    bridge._verifying = true;
+    bridge.payState = 'verifying';
+    var product = bridge._buying;
+    var attempts = 0;
+    function poll() {
+      refreshEntitlements().then(function (owned) {
+        if (owned.indexOf(product) >= 0) {
+          bridge.payState = 'done'; bridge._buying = ''; bridge._verifying = false; return;
+        }
+        if (++attempts >= 30) { bridge.payState = 'error'; bridge._buying = ''; bridge._verifying = false; return; }
+        setTimeout(poll, 1000);
+      }).catch(function () {
+        bridge.payState = 'error'; bridge._buying = ''; bridge._verifying = false;
+      });
+    }
+    poll();
+  }
 }());
 </script>
 
